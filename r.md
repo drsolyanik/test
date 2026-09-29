@@ -105,6 +105,3 @@ php artisan up
 cp -a /root/rconfig_backup/storage/app/* /var/www/html/rconfig/storage/app/
 chown -R www-data:www-data /var/www/html/rconfig/storage/app/
 ```
-# Пример копирования из бэкапа обратно в рабочую директорию (с заменой файлов)
-cp -a /root/rconfig_backup/storage/app/* /var/www/html/rconfig/storage/app/
-chown -R www-data:www-data /var/www/html/rconfig/storage/app/
