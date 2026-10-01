@@ -1,101 +1,69 @@
-## Шаг 1. Точная локализация через strace (Самый быстрый способ)
-Чтобы не гадать, на каком именно системном вызове умирает рабочий процесс при попытке подключения, отследите системные вызовы основного процесса smbd:
+1. Проверка уровней целостности через pdpl-file
+В Astra Linux за мандатный контроль и уровни целостности отвечает утилита pdpl-file (а не стандартный chilevel).
 
-Узнайте PID главного процесса smbd:
+Если astra-modeswitch прервался, каталоги Samba могли остаться с высокими атрибутами мандатного уровня, и smbd при старте не может создать в них файлы IPC.
 
-```
-pidof smbd
-```
+Проверьте текущие уровни целостности:
 
-Подключитесь утилитой strace с отслеживанием всех дочерних процессов (-f / -ff):
+Bash
+pdpl-file /run/samba /var/lib/samba /var/cache/samba
+(На рабочем сервере при отключенных/нулевых уровнях должно быть 0:0:0:0 или 0).
 
-```
-strace -ff -s 512 -p <PID_smbd> -o /tmp/smbd_strace.log
-```
+Принудительно сбросьте уровень целостности в 0:
 
-В другом терминале выполните попытку подключения: smbclient -L 127.0.0.1 -N.
+Bash
+systemctl stop smbd nmbd
+pdpl-file 0 /run/samba
+pdpl-file 0 /var/lib/samba
+pdpl-file 0 /var/cache/samba
+pdpl-file 0 /var/log/samba
+2. Проверка разделяемой памяти (Shared Memory / /dev/shm)
+Модуль messaging_init в Samba 4 активно использует POSIX shared memory и семафоры в /dev/shm. Если при сбое astra-modeswitch сбились права на /dev/shm или /tmp, создание IPC-сокетов блокируется.
 
-Завершите strace (Ctrl+C) и проверьте созданные файлы в /tmp/smbd_strace.log.*:
+Проверьте права и мандатный уровень /dev/shm:
 
-```
-grep -E 'EACCES|EPERM|SIGSEGV|exit_group' /tmp/smbd_strace.log*
-```
+Bash
+ls -ld /dev/shm /tmp
+pdpl-file /dev/shm /tmp
+Права должны быть drwxrwxrwt (1777), а уровень целостности — 0.
 
-Если там виден запуск clone() / fork(), а затем сразу exit_group() или падение при открытии /etc/pam.d/, /etc/parsec/ или сокетов /run/parsec/ — проблема зафиксирована в Astra-специфичном окружении.
+Если там остались старые файлы блокировок Samba от предыдущего режима, очистите их:
 
-## Шаг 2. Проверка конфликта smbd.socket и smbd.service
-В Astra Linux 1.8 по умолчанию используется Socket Activation от systemd. Если одновременно запущены и сокет, и сам сервис, порт 445/139 слушает systemd, передает файловый дескриптор в smbd, но тот не может корректно обработать соединение:
+Bash
+rm -rf /dev/shm/sem.smb* /dev/shm/smb*
+3. Разблокировка strace или ручной запуск smbd
+strace в Astra Linux заблокирован механизмом ptrace_scope в ядре. Чтобы временно разрешить трассировку для диагностики:
 
-Проверьте статус сокетов:
+Снимите ограничение ptrace:
 
-```
-systemctl status smbd.socket nmbd.socket
-```
+Bash
+sysctl -w kernel.yama.ptrace_scope=0
+Запустите трассировку инициализации IPC:
 
-Если они активны, отключите их и оставьте только классические сервисы:
+Bash
+strace -f -e trace=file,ipc,network smbd -F -i -d 3
+Вы увидите точную строчку, где Samba пытается сделать mkdir("/run/samba/ncalrpc") или shm_open() / bind() и получает от ядра ошибку EACCES (Permission denied) или EPERM.
 
-```
-systemctl stop smbd.socket nmbd.socket
-systemctl disable smbd.socket nmbd.socket
-systemctl restart smbd nmbd
-```
+4. Сравнение systemd-юнитов и PARSEC-директив
+В Astra Linux 1.8 службы systemd запускаются с учётом контекста безопасности PARSEC.
 
-## Шаг 3. Проверка привилегий и Capabilities исполняемых файлов
-При сбое astra-modeswitch с бинарников Samba могли слететь POSIX Capabilities (привилегии ядра, позволяющие smbd менять UID/GID и работать с сокетами от имени root при сниженном УЦ):
+Сравните файл /lib/systemd/system/smbd.service на сломанном и рабочем сервере.
 
-Проверьте наличиe capabilities на исполняемых файлах:
+Проверьте, нет ли переопределений в /etc/systemd/system/smbd.service.d/ или параметров вида:
 
-```
-getcap /usr/sbin/smbd /usr/sbin/nmbd
-```
+ParsecPrivileged=yes
 
-Проверьте уровень целостности самих бинарников:
+CapabilityBoundingSet=...
 
-```
-getilevel /usr/sbin/smbd /usr/sbin/nmbd
-```
+Выполните перезагрузку конфигурации systemd:
 
-Уровень должен быть равен 0.
+Bash
+systemctl daemon-reload
+systemctl restart smbd
+5. Точечный тест ручного запуска
+Остановите службу и запустите smbd вручную напрямую из консоли root:
 
-Если атрибуты сбились или выходы пустые, восстановите базовый уровень целостности бинарных файлов и библиотек Samba:
-
-```
-chilevel 0 /usr/sbin/smbd /usr/sbin/nmbd
-chilevel -R 0 /usr/lib/x86_64-linux-gnu/samba/
-```
-
-## Шаг 4. Проверка PAM-стека (модулей авторизации)
-Samba в Astra Linux тесно связана с PAM-модулями (pam_parsec.so, pam_astra.so). Если конфигурация PAM или права на доступ к конфигурации /etc/pam.d/samba нарушены, smbd аварийно завершает рабочий поток:
-
-Проверьте права на конфигурационные файлы PAM:
-
-```
-ls -la /etc/pam.d/samba*
-getilevel /etc/pam.d/samba
-```
-
-Временно проверьте локальную авторизацию через smbclient, отключив PAM-проверку в /etc/samba/smb.conf (только для теста):
-
-```
-[global]
-obey pam restrictions = no
-```
-
-После чего сделайте systemctl reload smbd и проверьте подключение.
-
-## Шаг 5. Чистая переустановка пакетов Samba (Сброс прав и xattr)
-Если удаление TDB-баз не помогло, а расширенные атрибуты (xattr) Parsec / DAC повреждены в файловой системе для пакета, проще всего переустановить Samba из штатных репозиториев Astra 1.8. Это пересоздаст все бинарники, права и сопутствующие файлы с правильными системными метками:
-
-```
-# Останавливаем службы
-systemctl stop smbd nmbd winbind
-
-# Переустанавливаем пакеты
-apt-get install --reinstall samba samba-common samba-common-bin libpam-samba2
-
-# Восстанавливаем права на основные каталоги
-chilevel -R 0 /var/lib/samba /var/cache/samba /var/log/samba /etc/samba
-
-# Запускаем службы
-systemctl start smbd nmbd
-```
+Bash
+systemctl stop smbd nmbd
+/usr/sbin/smbd -F -i -d 10 | grep -iE 'messaging|socket|lock|failed|error'
+Поскольку служба не будет уходить в фоновый режим, в первых 20–30 строках вывода отладки появится конкретная причина, почему smbd пропустил создание /run/samba/ncalrpc и /run/samba/msg.lock.
