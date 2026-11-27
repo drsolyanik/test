@@ -15,14 +15,18 @@
     _Пример: `sudo resize2fs /dev/vg0/lv0 3T`_
     
 3. Уменьшите размер LV до того же или чуть большего значения:
-    
+
+    ```
+    sudo e2fsck -f /dev/vg_data/lv_storage
+    ```
+
     ```
     sudo lvreduce -L <new_lv_size> /dev/<vg_name>/<lv_name>
     ```
     
     _Пример: `sudo lvreduce -L 3T /dev/vg0/lv0`_
     
-4. Проверьте целостность ФС и смонтируйте обратно:
+3. Проверьте целостность ФС и смонтируйте обратно:
     
     ```
     sudo e2fsck -f /dev/<vg_name>/<lv_name>
